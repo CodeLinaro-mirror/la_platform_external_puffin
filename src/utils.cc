@@ -6,19 +6,22 @@
 
 #include <inttypes.h>
 
+#include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
-
-#include <zlib.h>
 
 #include "puffin/src/bit_reader.h"
 #include "puffin/src/file_stream.h"
 #include "puffin/src/include/puffin/common.h"
-#include "puffin/src/include/puffin/errors.h"
 #include "puffin/src/include/puffin/puffer.h"
+#include "puffin/src/logging.h"
 #include "puffin/src/memory_stream.h"
 #include "puffin/src/puff_writer.h"
-#include "puffin/src/set_errors.h"
+
+using std::set;
+using std::string;
+using std::vector;
 
 namespace {
 // Use memcpy to access the unaligned data of type |T|.
@@ -29,62 +32,62 @@ inline T get_unaligned(const void* address) {
   return result;
 }
 
-// Calculate both the compressed size and uncompressed size of the deflate
-// block that starts from the offset |start| of buffer |data|.
-bool CalculateSizeOfDeflateBlock(const puffin::Buffer& data,
-                                 uint64_t start,
-                                 uint64_t* compressed_size,
-                                 uint64_t* uncompressed_size) {
-  TEST_AND_RETURN_FALSE(compressed_size != nullptr &&
-                        uncompressed_size != nullptr);
+struct ExtentData {
+  puffin::BitExtent extent;
+  uint64_t byte_offset;
+  uint64_t byte_length;
+  const puffin::Buffer& data;
 
-  TEST_AND_RETURN_FALSE(start < data.size());
-
-  z_stream strm = {};
-  strm.avail_in = data.size() - start;
-  strm.next_in = data.data() + start;
-
-  // -15 means we are decoding a 'raw' stream without zlib headers.
-  if (inflateInit2(&strm, -15)) {
-    LOG(ERROR) << "Failed to initialize inflate: " << strm.msg;
-    return false;
+  ExtentData(const puffin::BitExtent& in_extent, const puffin::Buffer& in_data)
+      : extent(in_extent), data(in_data) {
+    // Round start offset up and end offset down to exclude bits not in this
+    // extent. We simply ignore the bits at start and end that's not on byte
+    // boundary because as long as the majority of the bytes are the same,
+    // bsdiff will be able to reference it.
+    byte_offset = (extent.offset + 7) / 8;
+    uint64_t byte_end_offset = (extent.offset + extent.length) / 8;
+    CHECK(byte_end_offset <= data.size());
+    if (byte_end_offset > byte_offset) {
+      byte_length = byte_end_offset - byte_offset;
+    } else {
+      byte_length = 0;
+    }
   }
 
-  const unsigned int kBufferSize = 32768;
-  std::vector<uint8_t> uncompressed_data(kBufferSize);
-  *uncompressed_size = 0;
-  int status = Z_OK;
-  do {
-    // Overwrite the same buffer since we don't need the uncompressed data.
-    strm.avail_out = kBufferSize;
-    strm.next_out = uncompressed_data.data();
-    status = inflate(&strm, Z_NO_FLUSH);
-    if (status < 0) {
-      LOG(ERROR) << "Inflate failed: " << strm.msg << ", has decompressed "
-                 << *uncompressed_size << " bytes.";
-      return false;
+  int Compare(const ExtentData& other) const {
+    if (extent.length != other.extent.length) {
+      return extent.length < other.extent.length ? -1 : 1;
     }
-    *uncompressed_size += kBufferSize - strm.avail_out;
-  } while (status != Z_STREAM_END);
-
-  *compressed_size = data.size() - start - strm.avail_in;
-  TEST_AND_RETURN_FALSE(inflateEnd(&strm) == Z_OK);
-  return true;
-}
+    return memcmp(data.data() + byte_offset,
+                  other.data.data() + other.byte_offset,
+                  std::min(byte_length, other.byte_length));
+  }
+  bool operator<(const ExtentData& other) const { return Compare(other) < 0; }
+  bool operator==(const ExtentData& other) const { return Compare(other) == 0; }
+};
 
 }  // namespace
 
 namespace puffin {
 
-using std::string;
-using std::vector;
-
-uint64_t BytesInByteExtents(const vector<ByteExtent>& extents) {
-  uint64_t bytes = 0;
-  for (const auto& extent : extents) {
-    bytes += extent.length;
+bool LocateDeflatesInDeflateStream(const uint8_t* data,
+                                   uint64_t size,
+                                   uint64_t virtual_offset,
+                                   vector<BitExtent>* deflates,
+                                   uint64_t* compressed_size) {
+  Puffer puffer;
+  BufferBitReader bit_reader(data, size);
+  BufferPuffWriter puff_writer(nullptr, 0);
+  vector<BitExtent> sub_deflates;
+  TEST_AND_RETURN_FALSE(
+      puffer.PuffDeflate(&bit_reader, &puff_writer, &sub_deflates));
+  for (const auto& deflate : sub_deflates) {
+    deflates->emplace_back(deflate.offset + virtual_offset * 8, deflate.length);
   }
-  return bytes;
+  if (compressed_size) {
+    *compressed_size = bit_reader.Offset();
+  }
+  return true;
 }
 
 // This function uses RFC1950 (https://www.ietf.org/rfc/rfc1950.txt) for the
@@ -93,7 +96,7 @@ uint64_t BytesInByteExtents(const vector<ByteExtent>& extents) {
 // stream should be known before hand. Otherwise we need to parse the stream and
 // find the location of compressed blocks using CalculateSizeOfDeflateBlock().
 bool LocateDeflatesInZlib(const Buffer& data,
-                          std::vector<ByteExtent>* deflate_blocks) {
+                          std::vector<BitExtent>* deflates) {
   // A zlib stream has the following format:
   // 0           1     compression method and flag
   // 1           1     flag
@@ -119,7 +122,9 @@ bool LocateDeflatesInZlib(const Buffer& data,
   }
 
   // 4 is for ADLER32.
-  deflate_blocks->emplace_back(header_len, data.size() - header_len - 4);
+  TEST_AND_RETURN_FALSE(LocateDeflatesInDeflateStream(
+      data.data() + header_len, data.size() - header_len - 4, header_len,
+      deflates, nullptr));
   return true;
 }
 
@@ -136,11 +141,13 @@ bool FindDeflateSubBlocks(const UniqueStreamPtr& src,
 
     // Find all the subblocks.
     BufferBitReader bit_reader(deflate_buffer.data(), deflate.length);
+    // The uncompressed blocks will be ignored since we are passing a null
+    // buffered puff writer and a valid deflate locations output array. This
+    // should not happen in the puffdiff or anywhere else by default.
     BufferPuffWriter puff_writer(nullptr, 0);
-    Error error;
     vector<BitExtent> subblocks;
     TEST_AND_RETURN_FALSE(
-        puffer.PuffDeflate(&bit_reader, &puff_writer, &subblocks, &error));
+        puffer.PuffDeflate(&bit_reader, &puff_writer, &subblocks));
     TEST_AND_RETURN_FALSE(deflate.length == bit_reader.Offset());
     for (const auto& subblock : subblocks) {
       subblock_deflates->emplace_back(subblock.offset + deflate.offset * 8,
@@ -157,22 +164,14 @@ bool LocateDeflatesInZlibBlocks(const string& file_path,
   TEST_AND_RETURN_FALSE(src);
 
   Buffer buffer;
-  for (auto& zlib : zlibs) {
+  for (const auto& zlib : zlibs) {
     buffer.resize(zlib.length);
     TEST_AND_RETURN_FALSE(src->Seek(zlib.offset));
     TEST_AND_RETURN_FALSE(src->Read(buffer.data(), buffer.size()));
-
-    vector<ByteExtent> deflate_blocks;
-    TEST_AND_RETURN_FALSE(LocateDeflatesInZlib(buffer, &deflate_blocks));
-
-    vector<BitExtent> deflate_subblocks;
-    auto zlib_blc_src = MemoryStream::CreateForRead(buffer);
-    TEST_AND_RETURN_FALSE(
-        FindDeflateSubBlocks(zlib_blc_src, deflate_blocks, &deflate_subblocks));
-
-    // Relocated based on the offset of the zlib.
-    for (const auto& def : deflate_subblocks) {
-      deflates->emplace_back(zlib.offset * 8 + def.offset, def.length);
+    vector<BitExtent> tmp_deflates;
+    TEST_AND_RETURN_FALSE(LocateDeflatesInZlib(buffer, &tmp_deflates));
+    for (const auto& deflate : tmp_deflates) {
+      deflates->emplace_back(deflate.offset + zlib.offset * 8, deflate.length);
     }
   }
   return true;
@@ -180,8 +179,7 @@ bool LocateDeflatesInZlibBlocks(const string& file_path,
 
 // For more information about gzip format, refer to RFC 1952 located at:
 // https://www.ietf.org/rfc/rfc1952.txt
-bool LocateDeflatesInGzip(const Buffer& data,
-                          vector<ByteExtent>* deflate_blocks) {
+bool LocateDeflatesInGzip(const Buffer& data, vector<BitExtent>* deflates) {
   uint64_t member_start = 0;
   while (member_start < data.size()) {
     // Each member entry has the following format
@@ -230,21 +228,15 @@ bool LocateDeflatesInGzip(const Buffer& data,
       offset += 2;
     }
 
-    uint64_t compressed_size, uncompressed_size;
-    TEST_AND_RETURN_FALSE(CalculateSizeOfDeflateBlock(
-        data, offset, &compressed_size, &uncompressed_size));
-    TEST_AND_RETURN_FALSE(offset + compressed_size <= data.size());
-    deflate_blocks->push_back(ByteExtent(offset, compressed_size));
+    uint64_t compressed_size = 0;
+    TEST_AND_RETURN_FALSE(LocateDeflatesInDeflateStream(
+        data.data() + offset, data.size() - offset, offset, deflates,
+        &compressed_size));
     offset += compressed_size;
 
-    // Ignore CRC32;
+    // Ignore CRC32 and uncompressed size.
     TEST_AND_RETURN_FALSE(offset + 8 <= data.size());
-    offset += 4;
-    uint32_t u_size = 0;
-    for (size_t i = 0; i < 4; i++) {
-      u_size |= static_cast<uint32_t>(data[offset++]) << (i * 8);
-    }
-    TEST_AND_RETURN_FALSE(uncompressed_size % (1 << 31) == u_size);
+    offset += 8;
     member_start = offset;
   }
   return true;
@@ -253,7 +245,7 @@ bool LocateDeflatesInGzip(const Buffer& data,
 // For more information about the zip format, refer to
 // https://support.pkware.com/display/PKZIP/APPNOTE
 bool LocateDeflatesInZipArchive(const Buffer& data,
-                                vector<ByteExtent>* deflate_blocks) {
+                                vector<BitExtent>* deflates) {
   uint64_t pos = 0;
   while (pos <= data.size() - 30) {
     // TODO(xunchang) add support for big endian system when searching for
@@ -283,7 +275,6 @@ bool LocateDeflatesInZipArchive(const Buffer& data,
     }
 
     auto compressed_size = get_unaligned<uint32_t>(data.data() + pos + 18);
-    auto uncompressed_size = get_unaligned<uint32_t>(data.data() + pos + 22);
     auto file_name_length = get_unaligned<uint16_t>(data.data() + pos + 26);
     auto extra_field_length = get_unaligned<uint16_t>(data.data() + pos + 28);
     uint64_t header_size = 30 + file_name_length + extra_field_length;
@@ -295,33 +286,26 @@ bool LocateDeflatesInZipArchive(const Buffer& data,
       continue;
     }
 
-    uint64_t calculated_compressed_size;
-    uint64_t calculated_uncompressed_size;
-    if (!CalculateSizeOfDeflateBlock(data, pos + header_size,
-                                     &calculated_compressed_size,
-                                     &calculated_uncompressed_size)) {
+    vector<BitExtent> tmp_deflates;
+    uint64_t offset = pos + header_size;
+    uint64_t calculated_compressed_size = 0;
+    if (!LocateDeflatesInDeflateStream(
+            data.data() + offset, data.size() - offset, offset, &tmp_deflates,
+            &calculated_compressed_size)) {
       LOG(ERROR) << "Failed to decompress the zip entry starting from: " << pos
                  << ", skip adding deflates for this entry.";
       pos += 4;
       continue;
     }
 
-    // Double check the compressed size and uncompressed size if they are
-    // available in the file header.
+    // Double check the compressed size if it is available in the file header.
     if (compressed_size > 0 && compressed_size != calculated_compressed_size) {
       LOG(WARNING) << "Compressed size in the file header: " << compressed_size
                    << " doesn't equal the real size: "
                    << calculated_compressed_size;
     }
 
-    if (uncompressed_size > 0 &&
-        uncompressed_size != calculated_uncompressed_size) {
-      LOG(WARNING) << "Uncompressed size in the file header: "
-                   << uncompressed_size << " doesn't equal the real size: "
-                   << calculated_uncompressed_size;
-    }
-
-    deflate_blocks->emplace_back(pos + header_size, calculated_compressed_size);
+    deflates->insert(deflates->end(), tmp_deflates.begin(), tmp_deflates.end());
     pos += header_size + calculated_compressed_size;
   }
 
@@ -330,13 +314,7 @@ bool LocateDeflatesInZipArchive(const Buffer& data,
 
 bool LocateDeflateSubBlocksInZipArchive(const Buffer& data,
                                         vector<BitExtent>* deflates) {
-  vector<ByteExtent> deflate_blocks;
-  if (!LocateDeflatesInZipArchive(data, &deflate_blocks)) {
-    return false;
-  }
-
-  auto src = MemoryStream::CreateForRead(data);
-  return FindDeflateSubBlocks(src, deflate_blocks, deflates);
+  return LocateDeflatesInZipArchive(data, deflates);
 }
 
 bool FindPuffLocations(const UniqueStreamPtr& src,
@@ -366,9 +344,8 @@ bool FindPuffLocations(const UniqueStreamPtr& src,
     bit_reader.DropBits(bits_to_skip);
 
     BufferPuffWriter puff_writer(nullptr, 0);
-    Error error;
     TEST_AND_RETURN_FALSE(
-        puffer.PuffDeflate(&bit_reader, &puff_writer, nullptr, &error));
+        puffer.PuffDeflate(&bit_reader, &puff_writer, nullptr));
     TEST_AND_RETURN_FALSE(deflate_buffer.size() == bit_reader.Offset());
 
     // 1 if a deflate ends at the same byte that the next deflate starts and
@@ -409,4 +386,31 @@ bool FindPuffLocations(const UniqueStreamPtr& src,
   return true;
 }
 
+void RemoveEqualBitExtents(const Buffer& data1,
+                           const Buffer& data2,
+                           std::vector<BitExtent>* extents1,
+                           std::vector<BitExtent>* extents2) {
+  set<ExtentData> extent1_set, equal_extents;
+  for (const BitExtent& ext : *extents1) {
+    extent1_set.emplace(ext, data1);
+  }
+
+  auto new_extents2_end = extents2->begin();
+  for (const BitExtent& ext : *extents2) {
+    ExtentData extent_data(ext, data2);
+    if (extent1_set.find(extent_data) != extent1_set.end()) {
+      equal_extents.insert(extent_data);
+    } else {
+      *new_extents2_end++ = ext;
+    }
+  }
+  extents2->erase(new_extents2_end, extents2->end());
+  extents1->erase(
+      std::remove_if(extents1->begin(), extents1->end(),
+                     [&equal_extents, &data1](const BitExtent& ext) {
+                       return equal_extents.find(ExtentData(ext, data1)) !=
+                              equal_extents.end();
+                     }),
+      extents1->end());
+}
 }  // namespace puffin
